@@ -441,12 +441,19 @@ def main():
                 st.error(f"Error filling template: {e}")
                 return
 
-        for w in dup_warnings:
+        st.session_state["result"] = result
+        st.session_state["n_written"] = n_written
+        st.session_state["dup_warnings"] = dup_warnings
+
+    # Render download button outside the generate block so that clicking it
+    # does not re-trigger generation on the script rerun Streamlit performs.
+    if "result" in st.session_state:
+        for w in st.session_state["dup_warnings"]:
             st.warning(w)
-        st.success(f"Template filled with **{n_written}** competitor(s).")
+        st.success(f"Template filled with **{st.session_state['n_written']}** competitor(s).")
         st.download_button(
             label="Download Filled Template",
-            data=result,
+            data=st.session_state["result"],
             file_name="Market_Rent_Analysis_Filled.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
