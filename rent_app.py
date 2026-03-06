@@ -524,13 +524,14 @@ def _compute_linear_regression(x_vals, y_vals):
     return slope, intercept, r, r ** 2
 
 
-def _build_regression_figure(data: dict, title: str):
+def _build_regression_figure(data: dict, title: str, subject_data: dict | None = None):
     """
     Build a matplotlib scatter + regression line figure.
 
     data: {sqm_float: [price_float, ...]} — one price per competitor per size.
     Each (sqm, price) pair becomes one scatter point, coloured by size bucket.
-    The regression is fitted across all points.
+    subject_data: {sqm_float: price_float} — subject property rates; plotted as gold stars.
+    The regression is fitted across all competitor points only.
     """
     x_all, y_all = [], []
     for sz in sorted(data):
@@ -547,6 +548,14 @@ def _build_regression_figure(data: dict, title: str):
             [sz] * len(data[sz]), data[sz],
             color=cmap(idx % 10), s=70, zorder=3,
             label=f"{sz} SQM",
+        )
+
+    if subject_data:
+        sx = sorted(subject_data)
+        sy = [subject_data[sz] for sz in sx]
+        ax.scatter(
+            sx, sy, color="gold", s=220, zorder=6, marker="*",
+            edgecolors="black", linewidths=0.7, label="Subject Property",
         )
 
     reg = _compute_linear_regression(x_all, y_all)
@@ -578,10 +587,12 @@ def _build_regression_figure(data: dict, title: str):
     return fig
 
 
-def _render_market_summary(slots: list, gf_map: dict, ul_map: dict):
+def _render_market_summary(slots: list, gf_map: dict, ul_map: dict,
+                           subject_gf: dict | None = None, subject_ul: dict | None = None):
     """
-    Display min/max/mean/median per SQM size across all competitors and flag
-    any value more than 2 standard deviations from the mean as an outlier.
+    Display min/max/mean/median/Q1/Q3 per SQM size across all competitors, flag
+    Tukey IQR outliers, show regression charts with subject property overlay, and
+    render a colour-coded rate heatmap (competitor × SQM).
     """
     st.subheader("Market Rate Summary")
 
@@ -608,25 +619,42 @@ def _render_market_summary(slots: list, gf_map: dict, ul_map: dict):
             vals = data[sz]
             avg = statistics.mean(vals)
             med = statistics.median(vals)
-            rows.append({
+            row = {
                 "Size (SQM)": sz,
                 "Count": len(vals),
                 "Min ($)": f"${min(vals):.2f}",
                 "Max ($)": f"${max(vals):.2f}",
                 "Mean ($)": f"${avg:.2f}",
                 "Median ($)": f"${med:.2f}",
-            })
-            if len(vals) >= 3:
+                "Q1 ($)": "—",
+                "Q3 ($)": "—",
+            }
+            if len(vals) >= 4:
+                qs = statistics.quantiles(vals, n=4)
+                q1, q3 = qs[0], qs[2]
+                iqr_val = q3 - q1
+                fence_lo = q1 - 1.5 * iqr_val
+                fence_hi = q3 + 1.5 * iqr_val
+                row["Q1 ($)"] = f"${q1:.2f}"
+                row["Q3 ($)"] = f"${q3:.2f}"
+                for v in vals:
+                    if v < fence_lo or v > fence_hi:
+                        outlier_msgs.append(
+                            f"{sz} SQM: ${v:.2f} is outside Tukey IQR fence "
+                            f"(${fence_lo:.2f} – ${fence_hi:.2f})"
+                        )
+            elif len(vals) >= 3:
                 try:
                     sd = statistics.stdev(vals)
                     for v in vals:
                         if abs(v - avg) > 2 * sd:
                             outlier_msgs.append(
-                                f"{sz} SQM: ${v:.2f} is more than 2 standard deviations "
-                                f"from the mean (${avg:.2f} ± ${sd:.2f})"
+                                f"{sz} SQM: ${v:.2f} is >2 SD from mean "
+                                f"(${avg:.2f} ± ${sd:.2f}) [small sample]"
                             )
                 except statistics.StatisticsError:
                     pass
+            rows.append(row)
         return pd.DataFrame(rows), outlier_msgs
 
     gf_data = gather_vals(gf_map, "gf")
@@ -640,7 +668,7 @@ def _render_market_summary(slots: list, gf_map: dict, ul_map: dict):
             df, msgs = build_stats_df(gf_data)
             st.dataframe(df, use_container_width=True, hide_index=True)
             all_outliers.extend(f"GF — {m}" for m in msgs)
-            fig = _build_regression_figure(gf_data, "Ground Floor — Rent vs Size")
+            fig = _build_regression_figure(gf_data, "Ground Floor — Rent vs Size", subject_gf)
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
         else:
@@ -652,7 +680,7 @@ def _render_market_summary(slots: list, gf_map: dict, ul_map: dict):
             df, msgs = build_stats_df(ul_data)
             st.dataframe(df, use_container_width=True, hide_index=True)
             all_outliers.extend(f"UL — {m}" for m in msgs)
-            fig = _build_regression_figure(ul_data, "Upper Level — Rent vs Size")
+            fig = _build_regression_figure(ul_data, "Upper Level — Rent vs Size", subject_ul)
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
         else:
@@ -660,6 +688,68 @@ def _render_market_summary(slots: list, gf_map: dict, ul_map: dict):
 
     for msg in all_outliers:
         st.warning(f"Outlier detected: {msg}")
+
+    # ---- Rate Heatmap ----
+    st.markdown("#### Competitor Rate Heatmap")
+    st.caption(
+        "Colour scale per column: green = lower rate, red = higher rate. "
+        "★ Subject Property row is highlighted in amber."
+    )
+
+    def build_pivot(level_key: str, size_map: dict, subject_data: dict | None) -> pd.DataFrame:
+        sizes = sorted(size_map)
+        col_names = [f"{sz:g} SQM" for sz in sizes]
+        rows = []
+        for slot in slots:
+            comp = slot.get(level_key)
+            if not comp:
+                continue
+            row = {"Competitor": comp["name"] or "Unknown"}
+            for sz, col in zip(sizes, col_names):
+                v = comp["values"].get(sz)
+                if v is None:
+                    for k, kv in comp["values"].items():
+                        if abs(k - sz) <= 0.05:
+                            v = kv
+                            break
+                row[col] = v
+            rows.append(row)
+        if subject_data:
+            subject_row = {"Competitor": "★ Subject Property"}
+            for sz, col in zip(sizes, col_names):
+                subject_row[col] = subject_data.get(sz)
+            rows.append(subject_row)
+        return pd.DataFrame(rows)
+
+    def render_heatmap(level_key: str, size_map: dict, subject_data: dict | None):
+        df = build_pivot(level_key, size_map, subject_data)
+        if df.empty:
+            st.info("No data.")
+            return
+        size_cols = [c for c in df.columns if c != "Competitor"]
+        display = df.set_index("Competitor")
+
+        def highlight_subject(row):
+            if row.name == "★ Subject Property":
+                return ["background-color: #fff8e1; font-weight: bold"] * len(row)
+            return [""] * len(row)
+
+        comp_mask = display.index != "★ Subject Property"
+        styled = (
+            display[size_cols]
+            .style
+            .background_gradient(cmap="RdYlGn_r", axis=0,
+                                 subset=pd.IndexSlice[display.index[comp_mask], :])
+            .apply(highlight_subject, axis=1)
+            .format(lambda x: f"${x:.2f}" if pd.notna(x) else "—")
+        )
+        st.dataframe(styled, use_container_width=True)
+
+    tab_gf, tab_ul = st.tabs(["Ground Floor", "Upper Level"])
+    with tab_gf:
+        render_heatmap("gf", gf_map, subject_gf)
+    with tab_ul:
+        render_heatmap("ul", ul_map, subject_ul)
 
 
 # ==========================================
@@ -787,9 +877,11 @@ def main():
     for w in validate_floor_assignment(gf_comps, ul_comps):
         st.warning(w)
 
-    # ---- Peek at template: extract row maps and max slots ----
+    # ---- Peek at template: extract row maps, max slots, and subject rates ----
     gf_map: dict = {}
     ul_map: dict = {}
+    subject_gf: dict = {}
+    subject_ul: dict = {}
     max_slots = 16
     try:
         tmpl_bytes.seek(0)
@@ -798,6 +890,15 @@ def main():
             ws_peek = wb_peek["Comps & Unit Mix"]
             max_slots = get_max_comp_slots(ws_peek)
             gf_map, ul_map, _ = build_level_row_maps(ws_peek)
+            subject_col = column_index_from_string("M")
+            for sz, r in gf_map.items():
+                v = to_float(ws_peek.cell(r, subject_col).value)
+                if v is not None:
+                    subject_gf[sz] = v
+            for sz, r in ul_map.items():
+                v = to_float(ws_peek.cell(r, subject_col).value)
+                if v is not None:
+                    subject_ul[sz] = v
         tmpl_bytes.seek(0)
     except Exception:
         tmpl_bytes.seek(0)
@@ -821,7 +922,7 @@ def main():
     # ---- Market rate summary + outlier detection ----
     if gf_map or ul_map:
         st.markdown("---")
-        _render_market_summary(slots, gf_map, ul_map)
+        _render_market_summary(slots, gf_map, ul_map, subject_gf, subject_ul)
 
     # ---- Generate ----
     st.markdown("---")
