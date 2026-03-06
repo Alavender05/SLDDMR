@@ -6,6 +6,7 @@ import math
 import re
 import statistics
 
+import matplotlib.pyplot as plt
 import openpyxl
 import pandas as pd
 import streamlit as st
@@ -501,6 +502,82 @@ def _render_slot_editor(slots: list) -> list:
     return [slots[i] for i in included.index.tolist()]
 
 
+def _compute_linear_regression(x_vals, y_vals):
+    """
+    OLS linear regression using stdlib only.
+    Returns (slope, intercept, r, r_squared) or None if fewer than 2 points
+    or zero variance in x.
+    """
+    n = len(x_vals)
+    if n < 2:
+        return None
+    x_mean = statistics.mean(x_vals)
+    y_mean = statistics.mean(y_vals)
+    ss_xy = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_vals, y_vals))
+    ss_xx = sum((x - x_mean) ** 2 for x in x_vals)
+    ss_yy = sum((y - y_mean) ** 2 for y in y_vals)
+    if ss_xx == 0:
+        return None
+    slope = ss_xy / ss_xx
+    intercept = y_mean - slope * x_mean
+    r = ss_xy / math.sqrt(ss_xx * ss_yy) if ss_yy > 0 else 0.0
+    return slope, intercept, r, r ** 2
+
+
+def _build_regression_figure(data: dict, title: str):
+    """
+    Build a matplotlib scatter + regression line figure.
+
+    data: {sqm_float: [price_float, ...]} — one price per competitor per size.
+    Each (sqm, price) pair becomes one scatter point, coloured by size bucket.
+    The regression is fitted across all points.
+    """
+    x_all, y_all = [], []
+    for sz in sorted(data):
+        for price in data[sz]:
+            x_all.append(sz)
+            y_all.append(price)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    unique_sizes = sorted(data)
+    cmap = plt.colormaps.get_cmap("tab10")
+    for idx, sz in enumerate(unique_sizes):
+        ax.scatter(
+            [sz] * len(data[sz]), data[sz],
+            color=cmap(idx % 10), s=70, zorder=3,
+            label=f"{sz} SQM",
+        )
+
+    reg = _compute_linear_regression(x_all, y_all)
+    if reg:
+        slope, intercept, r, r_squared = reg
+        x_min, x_max = min(x_all), max(x_all)
+        ys = [slope * x + intercept for x in (x_min, x_max)]
+        ax.plot([x_min, x_max], ys, color="crimson", linewidth=2, zorder=4, label="Regression")
+
+        sign = "+" if intercept >= 0 else "-"
+        eq_text = (
+            f"y = {slope:.2f}x {sign} {abs(intercept):.2f}\n"
+            f"R² = {r_squared:.4f}\n"
+            f"r  = {r:.4f}"
+        )
+        ax.text(
+            0.97, 0.05, eq_text,
+            transform=ax.transAxes,
+            fontsize=9, verticalalignment="bottom", horizontalalignment="right",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85, edgecolor="#aaaaaa"),
+        )
+
+    ax.set_xlabel("Size (SQM)", fontsize=11)
+    ax.set_ylabel("Price ($)", fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    return fig
+
+
 def _render_market_summary(slots: list, gf_map: dict, ul_map: dict):
     """
     Display min/max/mean/median per SQM size across all competitors and flag
@@ -563,6 +640,9 @@ def _render_market_summary(slots: list, gf_map: dict, ul_map: dict):
             df, msgs = build_stats_df(gf_data)
             st.dataframe(df, use_container_width=True, hide_index=True)
             all_outliers.extend(f"GF — {m}" for m in msgs)
+            fig = _build_regression_figure(gf_data, "Ground Floor — Rent vs Size")
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
         else:
             st.info("No Ground Floor rate data available.")
 
@@ -572,6 +652,9 @@ def _render_market_summary(slots: list, gf_map: dict, ul_map: dict):
             df, msgs = build_stats_df(ul_data)
             st.dataframe(df, use_container_width=True, hide_index=True)
             all_outliers.extend(f"UL — {m}" for m in msgs)
+            fig = _build_regression_figure(ul_data, "Upper Level — Rent vs Size")
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
         else:
             st.info("No Upper Level rate data available.")
 
