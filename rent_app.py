@@ -5,7 +5,6 @@ import io
 import math
 import re
 import statistics
-
 import matplotlib.pyplot as plt
 import openpyxl
 import pandas as pd
@@ -119,44 +118,56 @@ def extract_comps_from_raw(raw_file_bytes):
 
 def build_level_row_maps(ws):
     """
-    Splits template size rows into Ground Floor and Upper Level purely by
-    position. First contiguous group of numeric col-C values = GF,
-    second group = UL.
+    Builds row maps for each floor level by reading the Type column (E)
+    to classify rows into Ground, Upper, Drive-up, and Vehicle/RV sections.
+
+    The template has multiple contiguous size blocks separated by header
+    rows (where column C = 'SM'). Each data row has:
+      - Column C: SQM value (float)
+      - Column D: Floor number (1 = ground level, 2 = upper level)
+      - Column E: Type string ('Drive-up', 'Ground', 'Upper', 'Vehicle', 'RV', 'Container')
+
+    Ground Floor StoreTrack data maps to Type='Ground' rows.
+    Upper Level StoreTrack data maps to Type='Upper' rows.
 
     Returns:
-        gf_map       – {sqm_float: row_int}
-        ul_map       – {sqm_float: row_int}
-        dup_warnings – list of strings for duplicate SQM sizes within a section
+        gf_map       - {sqm_float: row_int} for Ground rows
+        ul_map       - {sqm_float: row_int} for Upper rows
+        dup_warnings - list of strings for duplicate SQM sizes within a section
     """
-    groups: list[list[tuple[float, int]]] = []
-    current_group: list[tuple[float, int]] = []
+    gf_map: dict[float, int] = {}
+    ul_map: dict[float, int] = {}
+    gf_dups: list[str] = []
+    ul_dups: list[str] = []
 
     for r in range(12, ws.max_row + 1):
-        sm = to_float(ws.cell(r, 3).value)
-        if sm is not None:
-            current_group.append((sm, r))
-        elif current_group:
-            groups.append(current_group)
-            current_group = []
+        sm = to_float(ws.cell(r, 3).value)  # Column C: SQM
+        if sm is None:
+            continue
 
-    if current_group:
-        groups.append(current_group)
+        type_val = ws.cell(r, 5).value  # Column E: Type
+        if not isinstance(type_val, str):
+            continue
+        type_val = type_val.strip().lower()
 
-    def group_to_map(group):
-        m: dict[float, int] = {}
-        dups: list[str] = []
-        for sm, r in group:
-            if sm in m:
-                dups.append(
-                    f"{sm} SQM appears more than once in the template "
-                    f"(rows {m[sm]} and {r}); first occurrence used."
+        if type_val == "ground":
+            if sm in gf_map:
+                gf_dups.append(
+                    f"{sm} SQM appears more than once in the Ground section "
+                    f"(rows {gf_map[sm]} and {r}); first occurrence used."
                 )
             else:
-                m[sm] = r
-        return m, dups
-
-    gf_map, gf_dups = group_to_map(groups[0]) if len(groups) >= 1 else ({}, [])
-    ul_map, ul_dups = group_to_map(groups[1]) if len(groups) >= 2 else ({}, [])
+                gf_map[sm] = r
+        elif type_val == "upper":
+            if sm in ul_map:
+                ul_dups.append(
+                    f"{sm} SQM appears more than once in the Upper section "
+                    f"(rows {ul_map[sm]} and {r}); first occurrence used."
+                )
+            else:
+                ul_map[sm] = r
+        # Drive-up, Vehicle, RV, Container rows are skipped for now
+        # (not populated from StoreTrack GF/UL exports)
 
     return gf_map, ul_map, gf_dups + ul_dups
 
@@ -302,9 +313,34 @@ def validate_floor_assignment(gf_comps, ul_comps):
 
 def get_max_comp_slots(ws):
     """Derive how many competitor column slots fit in the sheet from column N onward."""
+    return len(find_asking_rate_columns(ws)) or 16
+
+
+def find_asking_rate_columns(ws):
+    """
+    Return a list of column indices that have 'Asking Rate' in row 11.
+    These are the competitor data columns (N, P, R, T, ...).
+
+    Scans up to 200 columns from N to avoid iterating through the full
+    16,383 Excel column range when the sheet has far-right formatting.
+    Stops early once 20 consecutive empty columns are encountered.
+    """
     first_ask_col = column_index_from_string("N")
-    available = (ws.max_column - first_ask_col) // 2 + 1
-    return max(1, min(available, 64))
+    max_scan = min(first_ask_col + 200, ws.max_column + 1)
+    cols = []
+    empty_streak = 0
+    for c in range(first_ask_col, max_scan):
+        v = ws.cell(11, c).value
+        if isinstance(v, str) and v.strip() == "Asking Rate":
+            cols.append(c)
+            empty_streak = 0
+        elif v is None or (isinstance(v, str) and not v.strip()):
+            empty_streak += 1
+            if empty_streak > 20:
+                break
+        else:
+            empty_streak = 0
+    return cols
 
 
 def find_closest_size(sz: float, size_map: dict, tolerance: float = 0.05):
@@ -342,15 +378,14 @@ def fill_template(template_file_bytes, slots, max_comp_slots=None):
     Each slot is {"gf": comp_or_None, "ul": comp_or_None}.
 
     Sheet: 'Comps & Unit Mix'
-      - Competitor name  → row 3,  columns N, P, R … (every 2 columns)
+      - Competitor name  → row 3,  Asking Rate columns (N, P, R, ...)
       - Competitor addr  → row 4,  same columns
       - Distance         → row 9,  same columns
       - Selected flag    → row 10, same columns  ('Yes')
-      - Ground Floor rates → first contiguous SQM group in col C (rows 12+)
-      - Upper Level rates  → second contiguous SQM group in col C (rows 12+)
+      - Ground rates     → Type='Ground' rows in col C (identified via col E)
+      - Upper rates      → Type='Upper' rows in col C (identified via col E)
 
     Rate cells receive currency formatting ($#,##0.00).
-    Header rows 3/4/9 copy their style from the adjacent column M reference cell.
     Size matching uses a ±0.05 SQM tolerance to handle minor float differences.
 
     Returns:
@@ -365,25 +400,29 @@ def fill_template(template_file_bytes, slots, max_comp_slots=None):
     ws = wb["Comps & Unit Mix"]
     gf_map, ul_map, dup_warnings = build_level_row_maps(ws)
 
-    if max_comp_slots is None:
-        max_comp_slots = get_max_comp_slots(ws)
+    # Get the actual Asking Rate columns from row 11
+    ask_columns = find_asking_rate_columns(ws)
+    if not ask_columns:
+        # Fallback to old N, P, R pattern
+        first_ask_col = column_index_from_string("N")
+        ask_columns = [first_ask_col + 2 * i for i in range(16)]
 
-    first_ask_col = column_index_from_string("N")
-    subject_col = column_index_from_string("M")
+    if max_comp_slots is None:
+        max_comp_slots = len(ask_columns)
+
     n_written = 0
     size_match_warnings: list[str] = []
 
     for i, slot in enumerate(slots[:max_comp_slots]):
-        ask_col = first_ask_col + 2 * i
+        if i >= len(ask_columns):
+            break
+        ask_col = ask_columns[i]
         gf_comp = slot["gf"]
         ul_comp = slot["ul"]
         identity = gf_comp or ul_comp
         comp_name = identity.get("name") or f"Competitor {i + 1}"
 
-        # Copy style from column M reference cell for header rows
-        for hr in (3, 4, 9):
-            _copy_cell_style(ws.cell(hr, subject_col), ws.cell(hr, ask_col))
-
+        # Write competitor header info
         ws.cell(3, ask_col).value = identity.get("name")
         ws.cell(4, ask_col).value = identity.get("address")
         if identity.get("distance") is not None:
@@ -798,8 +837,8 @@ def main():
             type=["xlsx"],
             key="tmpl",
             help="Must contain a sheet named 'Comps & Unit Mix'. "
-                 "Ground Floor rows are the first contiguous SQM block in column C; "
-                 "Upper Level rows are the second.",
+                 "Ground rows identified by Type='Ground' in column E; "
+                 "Upper rows by Type='Upper'.",
         )
 
     st.markdown("---")
@@ -812,7 +851,6 @@ def main():
         return
 
     # ---- Stale session state invalidation ----
-    # Clear any previous result when the uploaded files change.
     current_sig = (
         _file_signature(gf_file),
         _file_signature(ul_file),
@@ -877,7 +915,7 @@ def main():
     for w in validate_floor_assignment(gf_comps, ul_comps):
         st.warning(w)
 
-    # ---- Peek at template: extract row maps, max slots, and subject rates ----
+    # ---- Peek at template: extract row maps and max slots ----
     gf_map: dict = {}
     ul_map: dict = {}
     subject_gf: dict = {}
@@ -890,7 +928,9 @@ def main():
             ws_peek = wb_peek["Comps & Unit Mix"]
             max_slots = get_max_comp_slots(ws_peek)
             gf_map, ul_map, _ = build_level_row_maps(ws_peek)
-            subject_col = column_index_from_string("M")
+            # Subject property rates: check columns G (Per SM under SELECTED COMPS)
+            # In the new template, column G holds the subject's selected per-SM rate
+            subject_col = column_index_from_string("G")
             for sz, r in gf_map.items():
                 v = to_float(ws_peek.cell(r, subject_col).value)
                 if v is not None:
